@@ -10,8 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SWIFT_FRONTENDTOOL_TEXTUALINTERFACEGENERATION_H
-#define SWIFT_FRONTENDTOOL_TEXTUALINTERFACEGENERATION_H
+#ifndef SWIFT_FRONTEND_TEXTUALINTERFACEGENERATION_H
+#define SWIFT_FRONTEND_TEXTUALINTERFACEGENERATION_H
 
 #include "swift/Basic/LLVM.h"
 
