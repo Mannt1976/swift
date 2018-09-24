@@ -363,12 +363,14 @@ static bool printAsObjCIfNeeded(StringRef outputPath, ModuleDecl *M,
 /// \returns true if there were any errors
 ///
 /// \see swift::emitModuleInterface
-static bool printModuleInterfaceIfNeeded(StringRef outputPath, ModuleDecl *M) {
+static bool printModuleInterfaceIfNeeded(StringRef outputPath,
+                                         TextualInterfaceOptions const &Opts,
+                                         ModuleDecl *M) {
   if (outputPath.empty())
     return false;
   return atomicallyWritingToTextFile(outputPath, M->getDiags(),
-                                     [M](raw_ostream &out) -> bool {
-    return swift::emitModuleInterface(out, M);
+                                     [M, Opts](raw_ostream &out) -> bool {
+    return swift::emitModuleInterface(out, Opts, M);
   });
 }
 
@@ -1316,7 +1318,7 @@ static bool performCompileStepsPostSILGen(
 
   (void)printModuleInterfaceIfNeeded(
       PSPs.SupplementaryOutputs.ModuleInterfaceOutputPath,
-      Instance.getMainModule());
+      Invocation.getTextualInterfaceOptions(), Instance.getMainModule());
 
   if (Action == FrontendOptions::ActionType::EmitSIB)
     return serializeSIB(SM.get(), PSPs, Instance.getASTContext(), MSF);
