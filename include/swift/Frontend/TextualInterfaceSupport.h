@@ -14,6 +14,7 @@
 #define SWIFT_FRONTEND_TEXTUALINTERFACESUPPORT_H
 
 #include "swift/Basic/LLVM.h"
+#include "swift/Serialization/SerializedModuleLoader.h"
 #include "llvm/Support/Regex.h"
 
 namespace swift {
@@ -47,6 +48,37 @@ llvm::Regex getSwiftInterfaceModuleFlagsRegex();
 bool emitModuleInterface(raw_ostream &out,
                          TextualInterfaceOptions const &Opts,
                          ModuleDecl *M);
+
+
+/// A ModuleLoader that runs a subordinate \c CompilerInvocation and \c
+/// CompilerInstance to convert .swiftinterface files to .swiftmodule
+/// files on the fly, caching the resulting .swiftmodules in the module cache
+/// directory, and loading the serialized .swiftmodules from there.
+class TextualInterfaceModuleLoader : public SerializedModuleLoaderBase {
+  explicit TextualInterfaceModuleLoader(ASTContext &ctx, StringRef cacheDir,
+                                        DependencyTracker *tracker)
+    : SerializedModuleLoaderBase(ctx, tracker),
+      CacheDir(cacheDir)
+  {}
+
+  std::string CacheDir;
+
+  virtual std::error_code
+  openModuleFiles(StringRef DirName, StringRef ModuleFilename,
+                  StringRef ModuleDocFilename,
+                  std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
+                  std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
+                  llvm::SmallVectorImpl<char> &Scratch) override;
+
+public:
+  static std::unique_ptr<TextualInterfaceModuleLoader>
+  create(ASTContext &ctx, StringRef cacheDir,
+         DependencyTracker *tracker = nullptr) {
+    return std::unique_ptr<TextualInterfaceModuleLoader>(
+        new TextualInterfaceModuleLoader(ctx, cacheDir, tracker));
+  }
+};
+
 
 } // end namespace swift
 

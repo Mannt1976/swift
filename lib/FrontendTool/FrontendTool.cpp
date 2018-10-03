@@ -881,7 +881,7 @@ static bool performCompileStepsPostSILGen(
 /// \param Instance Will be reset after performIRGeneration when the verifier
 ///                 mode is NoVerify and there were no errors.
 /// \returns true on error
-static bool performCompile(CompilerInstance &Instance,
+bool swift::performCompile(CompilerInstance &Instance,
                            CompilerInvocation &Invocation,
                            ArrayRef<const char *> Args,
                            int &ReturnValue,
