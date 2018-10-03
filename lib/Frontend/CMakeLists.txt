@@ -9,6 +9,7 @@ add_swift_library(swiftFrontend STATIC
   FrontendOptions.cpp
   PrintingDiagnosticConsumer.cpp
   SerializedDiagnosticConsumer.cpp
+  TextualInterfaceSupport.cpp
   DEPENDS
     SwiftOptions
   LINK_LIBRARIES

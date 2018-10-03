@@ -1,4 +1,4 @@
-//===--- TextualInterfaceGeneration.h - swiftinterface files ----*- C++ -*-===//
+//===--- TextualInterfaceSupport.h - swiftinterface files ----*- C++ -*-===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -10,8 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SWIFT_FRONTEND_TEXTUALINTERFACEGENERATION_H
-#define SWIFT_FRONTEND_TEXTUALINTERFACEGENERATION_H
+#ifndef SWIFT_FRONTEND_TEXTUALINTERFACESUPPORT_H
+#define SWIFT_FRONTEND_TEXTUALINTERFACESUPPORT_H
 
 #include "swift/Basic/LLVM.h"
 #include "llvm/Support/Regex.h"
