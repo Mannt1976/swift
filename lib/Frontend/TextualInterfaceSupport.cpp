@@ -10,14 +10,17 @@
 //
 //===----------------------------------------------------------------------===//
 
+#define DEBUG_TYPE "textual-module-interface"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/TextualInterfaceSupport.h"
-#include "swift/FrontendTool/FrontendTool.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/Module.h"
+#include "swift/SILOptimizer/PassManager/Passes.h"
+#include "swift/Serialization/SerializationOptions.h"
 #include "clang/Basic/Module.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/Path.h"
@@ -63,76 +66,159 @@ extractSwiftInterfaceVersionAndArgs(DiagnosticEngine &Diags,
   return false;
 }
 
-/// Convert a .swiftinterface file to a .swiftmodule file
+void
+TextualInterfaceModuleLoader::configureSubInvocationAndOutputPath(
+    CompilerInvocation &SubInvocation,
+    StringRef InPath,
+    llvm::SmallString<128> &OutPath) {
+
+  auto &SearchPathOpts = Ctx.SearchPathOpts;
+  auto &LangOpts = Ctx.LangOpts;
+
+  // Start with a SubInvocation that copies various state from our
+  // invoking ASTContext.
+  SubInvocation.setImportSearchPaths(SearchPathOpts.ImportSearchPaths);
+  SubInvocation.setFrameworkSearchPaths(SearchPathOpts.FrameworkSearchPaths);
+  SubInvocation.setSDKPath(SearchPathOpts.SDKPath);
+  SubInvocation.setInputKind(InputFileKind::SwiftModuleInterface);
+  SubInvocation.setRuntimeResourcePath(SearchPathOpts.RuntimeResourcePath);
+  SubInvocation.setTargetTriple(LangOpts.Target);
+
+  // Calculate an output filename based on the SubInvocation hash, and
+  // wire up the SubInvocation's InputsAndOutputs to contain both
+  // input and output filenames.
+  OutPath = CacheDir;
+  llvm::sys::path::append(OutPath, llvm::sys::path::stem(InPath));
+  OutPath.append("-");
+  OutPath.append(SubInvocation.getPCHHash());
+  OutPath.append(".");
+  auto Ext = file_types::getExtension(file_types::TY_SwiftModuleFile);
+  OutPath.append(Ext);
+
+  auto &FEOpts = SubInvocation.getFrontendOptions();
+  FEOpts.RequestedAction = FrontendOptions::ActionType::EmitModuleOnly;
+  FEOpts.InputsAndOutputs.addPrimaryInputFile(InPath);
+  FEOpts.InputsAndOutputs.setMainAndSupplementaryOutputs(
+    {OutPath.str()}, {SupplementaryOutputPaths()});
+}
+
+// FIXME: this needs to be a more extensive up-to-date check.
+static bool
+swiftModuleIsUpToDate(clang::vfs::FileSystem &FS,
+                      StringRef InPath, StringRef OutPath) {
+  if (FS.exists(OutPath)) {
+    auto InStatus = FS.status(InPath);
+    auto OutStatus = FS.status(OutPath);
+    if (InStatus && OutStatus) {
+      return InStatus.get().getLastModificationTime() <=
+        OutStatus.get().getLastModificationTime();
+    }
+  }
+  return false;
+}
+
+static bool buildSwiftModuleFromSwiftInterface(
+    clang::vfs::FileSystem &FS, DiagnosticEngine &Diags,
+    CompilerInvocation &SubInvocation, StringRef InPath, StringRef OutPath) {
+  bool SubError = false;
+  bool RunSuccess = llvm::CrashRecoveryContext().RunSafelyOnThread([&] {
+
+    llvm::BumpPtrAllocator SubArgsAlloc;
+    llvm::StringSaver SubArgSaver(SubArgsAlloc);
+    SmallVector<const char *, 16> SubArgs;
+    swift::version::Version Vers;
+    if (extractSwiftInterfaceVersionAndArgs(Diags, FS, InPath, Vers,
+                                            SubArgSaver, SubArgs)) {
+      SubError = true;
+      return;
+    }
+
+    if (SubInvocation.parseArgs(SubArgs, Diags)) {
+      SubError = true;
+      return;
+    }
+
+    // Build the .swiftmodule; this is a _very_ abridged version of the logic in
+    // performCompile in libFrontendTool, specialized, to just the one
+    // module-serialization task we're trying to do here.
+    LLVM_DEBUG(llvm::dbgs() << "Setting up instance\n");
+    CompilerInstance SubInstance;
+    if (SubInstance.setup(SubInvocation)) {
+      SubError = true;
+      return;
+    }
+
+    LLVM_DEBUG(llvm::dbgs() << "Performing sema\n");
+    SubInstance.performSema();
+    if (SubInstance.getASTContext().hadError()) {
+      SubError = true;
+      return;
+    }
+
+    auto Mod = SubInstance.getMainModule();
+    auto SILMod = SubInstance.takeSILModule();
+    if (SILMod) {
+      LLVM_DEBUG(llvm::dbgs() << "Running SIL diagnostic passes\n");
+      if (runSILDiagnosticPasses(*SILMod)) {
+        SubError = true;
+        return;
+      }
+    }
+
+    LLVM_DEBUG(llvm::dbgs() << "Serializing " << OutPath << "\n");
+    SerializationOptions serializationOpts;
+    std::string OutPathStr = OutPath;
+    serializationOpts.OutputPath = OutPathStr.c_str();
+    serializationOpts.SerializeAllSIL = true;
+    serialize(Mod, serializationOpts, SILMod.get());
+    SubError = Diags.hadAnyError();
+  });
+  return !RunSuccess || SubError;
+}
+
+/// Load a .swiftmodule associated with a .swiftinterface either from a
+/// cache or by converting it in a subordinate \c CompilerInstance, caching
+/// the results.
 std::error_code TextualInterfaceModuleLoader::openModuleFiles(
     StringRef DirName, StringRef ModuleFilename, StringRef ModuleDocFilename,
     std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
     std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
     llvm::SmallVectorImpl<char> &Scratch) {
 
-  std::error_code ErrorCode;
   auto &FS = *Ctx.SourceMgr.getFileSystem();
   auto &Diags = Ctx.Diags;
-  auto &SearchPathOpts = Ctx.SearchPathOpts;
-
   llvm::SmallString<128> InPath, OutPath;
+
+  // First check to see if the .swiftinterface exists at all. Bail if not.
   InPath = DirName;
-  OutPath = CacheDir;
   llvm::sys::path::append(InPath, ModuleFilename);
-  // FIXME: this is not a good enough name.
-  llvm::sys::path::append(OutPath, ModuleFilename);
-  llvm::sys::path::replace_extension(InPath, file_types::getExtension(
-                                      file_types::TY_SwiftModuleInterfaceFile));
+  auto Ext = file_types::getExtension(file_types::TY_SwiftModuleInterfaceFile);
+  llvm::sys::path::replace_extension(InPath, Ext);
+  if (!FS.exists(InPath))
+    return std::make_error_code(std::errc::no_such_file_or_directory);
 
-  bool success = llvm::CrashRecoveryContext().RunSafelyOnThread([&] {
-    llvm::BumpPtrAllocator SubArgsAlloc;
-    llvm::StringSaver SubArgSaver(SubArgsAlloc);
-    SmallVector<const char *, 16> SubArgs;
-    swift::version::Version Vers;
+  // Set up a _potential_ sub-invocation to consume the .swiftinterface and emit
+  // the .swiftmodule.
+  CompilerInvocation SubInvocation;
+  configureSubInvocationAndOutputPath(SubInvocation, InPath, OutPath);
 
-    // Set up a sub-invocation to consume the .swiftinterface and emit the
-    // .swiftmodule
-    CompilerInvocation SubInvocation;
-    SubInvocation.setImportSearchPaths(SearchPathOpts.ImportSearchPaths);
-    SubInvocation.setFrameworkSearchPaths(SearchPathOpts.FrameworkSearchPaths);
-    SubInvocation.setSDKPath(SearchPathOpts.SDKPath);
-    SubInvocation.setInputKind(InputFileKind::SwiftModuleInterface);
-    auto &FEOpts = SubInvocation.getFrontendOptions();
-    FEOpts.RequestedAction = FrontendOptions::ActionType::EmitModuleOnly;
-    FEOpts.InputsAndOutputs.addPrimaryInputFile(InPath);
-    FEOpts.InputsAndOutputs.setMainAndSupplementaryOutputs({OutPath.str()}, {});
-
-    // Add in any arguments that were saved-in and thus specified _by_ the
-    // .swiftinterface
-    if (extractSwiftInterfaceVersionAndArgs(Diags, FS, InPath, Vers,
-                                            SubArgSaver, SubArgs)) {
-      ErrorCode = std::make_error_code(std::errc::invalid_argument);
-      return;
-    }
-
-    if (SubInvocation.parseArgs(SubArgs, Diags)) {
-      ErrorCode = std::make_error_code(std::errc::invalid_argument);
-      return;
-    }
-
-    // Build the .swiftmodule
-    CompilerInstance SubInstance;
-    int ReturnValue = 0;
-    if (swift::performCompile(SubInstance, SubInvocation, SubArgs,
-                              ReturnValue) ||
-        ReturnValue != 0)
-      ErrorCode = std::make_error_code(std::errc::invalid_argument);
-  });
-  if (!success)
-    ErrorCode = std::make_error_code(std::errc::invalid_argument);
+  // Evaluate if we need to run this sub-invocation, and if so run it.
+  if (!swiftModuleIsUpToDate(FS, InPath, OutPath)) {
+    if (buildSwiftModuleFromSwiftInterface(FS, Diags, SubInvocation, InPath,
+                                           OutPath))
+      return std::make_error_code(std::errc::invalid_argument);
+  }
 
   // Finish off by delegating back up to the SerializedModuleLoaderBase
   // routine that can load the recently-manufactured serialized module.
-  if (!ErrorCode) {
-    ErrorCode = SerializedModuleLoaderBase::openModuleFiles(
-        DirName, ModuleFilename, ModuleDocFilename, ModuleBuffer,
-        ModuleDocBuffer, Scratch);
-  }
+  LLVM_DEBUG(llvm::dbgs() << "Loading " << OutPath
+             << " via normal module loader\n");
+  auto ErrorCode = SerializedModuleLoaderBase::openModuleFiles(
+      CacheDir, llvm::sys::path::filename(OutPath), ModuleDocFilename,
+      ModuleBuffer, ModuleDocBuffer, Scratch);
+  LLVM_DEBUG(llvm::dbgs() << "Loaded " << OutPath
+             << " via normal module loader with error: "
+             << ErrorCode.message() << "\n");
   return ErrorCode;
 }
 
@@ -143,8 +229,9 @@ std::error_code TextualInterfaceModuleLoader::openModuleFiles(
 /// builds.
 ///
 /// These come from declarations like `import class FooKit.MainFooController`.
-static void diagnoseScopedImports(DiagnosticEngine &diags,
-                                  ArrayRef<ModuleDecl::ImportedModule> imports){
+static void
+diagnoseScopedImports(DiagnosticEngine &diags,
+                      ArrayRef<ModuleDecl::ImportedModule> imports) {
   for (const ModuleDecl::ImportedModule &importPair : imports) {
     if (importPair.first.empty())
       continue;
@@ -161,8 +248,8 @@ static void printToolVersionAndFlagsComment(raw_ostream &out,
   auto &Ctx = M->getASTContext();
   out << "// " SWIFT_TOOLS_VERSION_KEY ": "
       << Ctx.LangOpts.EffectiveLanguageVersion << "\n";
-  out << "// " SWIFT_MODULE_FLAGS_KEY ": "
-      << Opts.TextualInterfaceFlags << "\n";
+  out << "// " SWIFT_MODULE_FLAGS_KEY ": " << Opts.TextualInterfaceFlags
+      << "\n";
 }
 
 llvm::Regex swift::getSwiftInterfaceToolsVersionRegex() {
@@ -179,7 +266,8 @@ llvm::Regex swift::getSwiftInterfaceModuleFlagsRegex() {
 /// source declarations.
 static void printImports(raw_ostream &out, ModuleDecl *M) {
   // FIXME: This is very similar to what's in Serializer::writeInputBlock, but
-  // it's not obvious what higher-level optimization would be factored out here.
+  // it's not obvious what higher-level optimization would be factored out
+  // here.
   SmallVector<ModuleDecl::ImportedModule, 8> allImports;
   M->getImportedModules(allImports, ModuleDecl::ImportFilter::All);
   ModuleDecl::removeDuplicateImports(allImports);
@@ -190,7 +278,8 @@ static void printImports(raw_ostream &out, ModuleDecl *M) {
   SmallVector<ModuleDecl::ImportedModule, 8> publicImports;
   M->getImportedModules(publicImports, ModuleDecl::ImportFilter::Public);
   llvm::SmallSet<ModuleDecl::ImportedModule, 8,
-                 ModuleDecl::OrderImportedModules> publicImportSet;
+                 ModuleDecl::OrderImportedModules>
+      publicImportSet;
   publicImportSet.insert(publicImports.begin(), publicImports.end());
 
   for (auto import : allImports) {

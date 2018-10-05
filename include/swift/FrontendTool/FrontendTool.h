@@ -28,7 +28,6 @@ namespace swift {
 class CompilerInvocation;
 class CompilerInstance;
 class SILModule;
-class UnifiedStatsReporter;
 
 /// A simple observer of frontend activity.
 ///
@@ -79,12 +78,6 @@ int performFrontend(ArrayRef<const char *> args,
                     void *mainAddr,
                     FrontendObserver *observer = nullptr);
 
-bool performCompile(CompilerInstance &Instance,
-                    CompilerInvocation &Invocation,
-                    ArrayRef<const char *> Args,
-                    int &ReturnValue,
-                    FrontendObserver *observer = nullptr,
-                    UnifiedStatsReporter *Stats = nullptr);
 
 } // namespace swift
 

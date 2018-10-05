@@ -63,7 +63,12 @@ class TextualInterfaceModuleLoader : public SerializedModuleLoaderBase {
 
   std::string CacheDir;
 
-  virtual std::error_code
+  void
+  configureSubInvocationAndOutputPath(CompilerInvocation &SubInvocation,
+                                      StringRef InPath,
+                                      llvm::SmallString<128> &OutPath);
+
+  std::error_code
   openModuleFiles(StringRef DirName, StringRef ModuleFilename,
                   StringRef ModuleDocFilename,
                   std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,

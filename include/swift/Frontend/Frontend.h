@@ -132,6 +132,7 @@ public:
                               StringRef SDKPath,
                               StringRef ResourceDir);
 
+  void setTargetTriple(const llvm::Triple &Triple);
   void setTargetTriple(StringRef Triple);
 
   StringRef getTargetTriple() const {
@@ -342,6 +343,10 @@ public:
   /// so return the TBDPath when in that mode and fail an assert
   /// if not in that mode.
   std::string getTBDPathForWholeModule() const;
+
+  SerializationOptions
+  computeSerializationOptions(const SupplementaryOutputPaths &outs,
+                              bool moduleIsPublic);
 };
 
 /// A class which manages the state and execution of the compiler.
